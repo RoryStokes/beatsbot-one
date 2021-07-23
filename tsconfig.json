@@ -1,0 +1,10 @@
+{
+    "compilerOptions": {
+      "lib": ["es2020", "DOM"],
+      "module": "commonjs",
+      "target": "es2020",
+      "outDir": "dist"
+    },
+    "include": ["src/**/*", "src/types.d.ts"],
+    "exclude": ["node_modules"]
+  }

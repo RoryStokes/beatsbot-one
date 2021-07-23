@@ -1,0 +1,7 @@
+[Unit]
+Description=The One and only
+
+[Service]
+User=rory
+EnvironmentFile=/home/rory/Dropbox/beatsbot-one/bot/env.sh
+ExecStart=/home/rory/Dropbox/beatsbot-one/bot/run-local.sh
