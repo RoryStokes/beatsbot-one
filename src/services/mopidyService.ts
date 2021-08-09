@@ -1,27 +1,43 @@
 import * as Mopidy from "mopidy";
+import { countBy, groupBy } from "lodash";
 
-export type Song = Mopidy.models.Track & {
+export type TrackRef = {
+  name: string;
+  uri: string;
+};
+
+export type Track = Mopidy.models.Track;
+
+export type Song = Track & {
   derived: {
-    artistString: string,
-    songName: string,
-    songString: string,
-    durationString: string,
-  }
-}
+    artistString: string;
+    songName: string;
+    songString: string;
+    durationString: string;
+  };
+};
 
 export class MopidyService {
-  private client;
+  private client: Mopidy;
   public playing: boolean;
   public currentSong?: Song;
+  public currentTracklist?: string[] = [];
+  private onPlayHandler;
+  private onStopHandler;
+  private prePlayHandler;
+  private onQueueHandler: (track: Track) => Promise<void>;
 
   constructor(config) {
     this.client = new Mopidy({
       webSocketUrl: config.mopidyWsUrl,
     });
-    
+
     this.playing = false;
 
-    this.client.on("state:online", this.checkPlaying.bind(this));
+    this.client.on("state:online", async () =>{
+      await this.checkPlaying();
+      this.currentTracklist = ((await this.client.tracklist?.getTracks()) || []).map(t => t.uri);
+    });
 
     this.client.on(
       "event:trackPlaybackStarted",
@@ -32,12 +48,31 @@ export class MopidyService {
 
     this.client.on(
       "event:playbackStateChanged",
-      async function (event) {
+      async (event) => {
         if (event.new_state === "stopped") {
           this.stopped();
         }
-      }.bind(this)
+      }
     );
+
+    this.client.on("event:tracklistChanged", async () => {
+      const index = await this.client.tracklist.index({});
+
+      const currentTracklist = this.currentTracklist.slice() || [];
+      const currentCounts = countBy(currentTracklist.slice(index + 1));
+      console.log(index);
+
+      const newTracklist = await this.client.tracklist?.getTracks() || [];
+      const newTracks = groupBy(newTracklist.slice(index + 1), "uri")
+      
+      const added = Object.keys(newTracks).flatMap(uri => newTracks[uri].slice(currentCounts[uri] || 0));
+
+      this.currentTracklist = newTracklist.map(t => t.uri);
+
+      if(this.onQueueHandler) {
+        added.forEach(this.onQueueHandler)
+      }
+    });
   }
 
   async checkPlaying() {
@@ -101,26 +136,27 @@ export class MopidyService {
   }
 
   async getSong(uri, points) {
-    const result = await this.client.library.lookup(uri);
-    const song = Object.assign({ points }, result[0]);
+    const result = await this.client.library.lookup({ uris: [uri] });
+    const song = Object.assign({ points }, result[0][0]);
     return this.deriveSongFields(song);
   }
 
   async getRecent(maxResults = 5) {
-    const history = await this.client.history.getHistory();
+    const history = (await this.client.history.getHistory()) as any;
+    console.log(JSON.stringify(history, null, 2));
     return history
       .slice(0, maxResults)
       .map(([timestamp, song]) => this.deriveSongFields(song));
   }
 
   async getImage(song: Song) {
-    const imageMap = await this.client.library.getImages({ uris: [song.uri]});
+    const imageMap = await this.client.library.getImages({ uris: [song.uri] });
     return imageMap[song.uri][0] ? imageMap[song.uri][0].uri : null;
   }
 
   async getQueue() {
     const tracks = await this.client.tracklist.getTracks();
-    const index = await this.client.tracklist.index();
+    const index = await this.client.tracklist.index({});
     return { tracks, index };
   }
 
@@ -133,67 +169,154 @@ export class MopidyService {
     }
   }
 
-  async playSong(songUris, playNow) {
+  async playTracks(tracks: TrackRef[], playNow: boolean) {
     if (playNow || (await this.client.playback.getState()) !== "playing") {
       await this.client.tracklist.clear();
-      await this.client.tracklist.add(null, null, null, songUris);
-      await this.client.playback.play();
+      await this.client.tracklist.add({ uris: tracks.map(t => t.uri) });
+      await this.client.playback.play({});
       return true;
     } else {
-      await this.client.tracklist.add(null, null, null, songUris);
+      await this.client.tracklist.add({ uris: tracks.map(t => t.uri) });
       return false;
     }
   }
 
+  async playUri(uri: string, playNow: boolean) {
+    if (playNow || (await this.client.playback.getState()) !== "playing") {
+      await this.client.tracklist.clear();
+      await this.client.tracklist.add({ uris: [uri] });
+      await this.client.playback.play({});
+      return true;
+    } else {
+      await this.client.tracklist.add({ uris: [uri] });
+      return false;
+    }
+  }
 
   nowPlaying(song) {
     this.playing = true;
     this.currentSong = this.deriveSongFields(song);
 
-    if (this.onPlay) {
-      this.onPlay(this.currentSong);
+    if (this.onPlayHandler) {
+      this.onPlayHandler(this.currentSong);
     }
   }
 
   stopped() {
     this.playing = false;
 
-    if (this.onStop) {
-      this.onStop(this.currentSong);
+    if (this.onStopHandler) {
+      this.onStopHandler(this.currentSong);
     }
 
     this.currentSong = null;
   }
 
   prePlay(handler) {
-    this.prePlay = handler;
+    this.prePlayHandler = handler;
   }
 
   onPlay(handler) {
-    this.onPlay = handler;
+    this.onPlayHandler = handler;
   }
 
   onStop(handler) {
-    this.onStop = handler;
+    this.onStopHandler = handler;
+  }
+
+  onQueue(handler: (track: Track) => Promise<void>) {
+    this.onQueueHandler = handler;
   }
 
   stop() {
-    this.client.tracklist.setRepeat(false);
-    this.client.tracklist.setSingle(false);
+    this.client.tracklist.setRepeat({ value: false });
+    this.client.tracklist.setSingle({ value: false });
     return this.client.playback.stop();
   }
 
   repeat(single) {
-    this.client.tracklist.setRepeat(true);
-    this.client.tracklist.setSingle(single);
+    this.client.tracklist.setRepeat({ value: true });
+    this.client.tracklist.setSingle({ value: single });
   }
 
+  async playlistQuery(queries: string[]): Promise<TrackRef[]> {
+    if (this.client.playlists && this.client.library) {
+      const allPlaylists = await this.client.playlists.asList();
+      const filteredPlaylistRefs = allPlaylists.filter((p) =>
+        queries.some((q) => p.name.toLowerCase().startsWith(q))
+      );
+      const playlists = await Promise.all(
+        filteredPlaylistRefs.map((p) =>
+          this.client.playlists.lookup({ uri: p.uri })
+        )
+      );
+      const playlistTracks = playlists.flatMap((p) => p.tracks);
+
+      const localTracks = await this.getLocalTracksMatchingQuery(
+        "file:///home/rory/Dropbox/Chatsongs",
+        queries,
+        this.client.library
+      );
+
+      console.log(playlistTracks);
+      console.log(localTracks);
+
+      return [...playlistTracks, ...localTracks];
+    }
+  }
+
+  async getLocalTracksMatchingQuery(
+    uri: string,
+    queries: string[],
+    library: Mopidy.core.LibraryController
+  ): Promise<TrackRef[]> {
+    return this.flattenPromises(
+      (await library.browse({ uri })).flatMap(async (ref) => {
+        if (ref.type == "directory") {
+          if (queries.some((q) => ref.name.toLowerCase().startsWith(q))) {
+            return await this.getAllChildTracks(ref, library);
+          }
+          this.getLocalTracksMatchingQuery(ref.uri, queries, library);
+        }
+        return [];
+      })
+    );
+  }
+
+  async getAllChildTracks(
+    directory: Mopidy.models.Ref<"directory">,
+    library: Mopidy.core.LibraryController
+  ): Promise<TrackRef[]> {
+    return this.flattenPromises(
+      (await library.browse({ uri: directory.uri })).flatMap(
+        async (ref: Mopidy.models.Ref<Mopidy.models.ModelType>) => {
+          if (this.refIsType(ref, "directory")) {
+            return await this.getAllChildTracks(ref, library);
+          } else if (this.refIsType(ref, "track")) {
+            return [ref];
+          }
+          return [];
+        }
+      )
+    );
+  }
+
+  private refIsType<A extends Mopidy.models.ModelType>(
+    ref: Mopidy.models.Ref<any>,
+    type: A
+  ): ref is Mopidy.models.Ref<A> {
+    return ref.type == type;
+  }
+
+  private flattenPromises<A>(promises: Promise<A[]>[]): Promise<A[]> {
+    return Promise.all(promises).then((n) => n.flatMap((a) => a));
+  }
   async search(query, source) {
     const uris = source ? [`${source}:`] : null;
-    const result = await this.client.library.search(
-      { any: query.split(" ") },
-      uris
-    );
+    const result = await this.client.library.search({
+      query: { any: query.split(" ") },
+      uris,
+    });
     return result[0];
   }
 }

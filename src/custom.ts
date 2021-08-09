@@ -1,30 +1,30 @@
 const maymays = [
   {
-    uri: 'local:track:Gud%20song/02.%20Bring%20Me%20To%20Life.mp3',
+    uri: 'local:track:gud%20song/02.%20Bring%20Me%20To%20Life.mp3',
     triggers: [['wake'], ['up']]
   },
   {
-    uri: 'local:track:Sound%20Bytes/Song%20bits/I_Will_Always_Love_You_Whitney.mp3',
+    uri: 'local:track:sound%20bytes/Song%20bits/I_Will_Always_Love_You_Whitney.mp3',
     triggers: [['and i']]
   },
   {
-    uri: 'local:track:Sound%20Bytes/Memeliners/shaboy.mp3',
+    uri: 'local:track:sound%20bytes/Memeliners/shaboy.mp3',
     triggers: [['shaboi', 'shaboy']]
   },
   {
-    uri: 'local:track:Sound%20Bytes/Welcome%20to%20EB%20Games..mp3',
+    uri: 'local:track:sound%20bytes/Welcome%20to%20EB%20Games..mp3',
     triggers: [['guys'], ['woah', 'hey']]
   },
   {
-    uri: 'local:track:Sound%20Bytes/Memeliners/check.mp3',
+    uri: 'local:track:sound%20bytes/Memeliners/check.mp3',
     triggers: [['tier'], ['check', 'list']]
   },
   {
-    uri: 'local:track:Sound%20Bytes/Crond6/Sick%20Joke.mp3',
+    uri: 'local:track:sound%20bytes/crond6/Sick%20Joke.mp3',
     triggers: [['sick joke']]
   },
   {
-    uri: 'local:track:Sound%20Bytes/Memeliners/oh%20god%20i%20love%20memes.mp3',
+    uri: 'local:track:sound%20bytes/memeliners/oh%20god%20i%20love%20memes.mp3',
     triggers: [['meme'], ['like', 'love', 'feel']]
   },
   {

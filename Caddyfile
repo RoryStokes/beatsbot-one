@@ -1,0 +1,14 @@
+{
+    http_port  80
+    https_port 443
+}
+
+beatsbot.one {
+    route / {
+        redir https://beatsbot.one/iris/
+    }
+    route /play {
+        reverse_proxy 10.0.0.155:5000
+    }
+    reverse_proxy 10.0.0.155:6680
+}
