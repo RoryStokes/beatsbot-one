@@ -1,17 +1,35 @@
-import { VoiceConnection } from "discord.js";
+import {
+  AudioPlayer,
+  AudioResource,
+  createAudioPlayer,
+  createAudioResource,
+  NoSubscriberBehavior,
+  StreamType,
+  VoiceConnection,
+} from "@discordjs/voice";
 import { FFmpeg } from "prism-media";
 
 type AudioServiceConfig = { maxTransmissionGap: number; audioDevice: string };
 
 export class AudioService {
   private config: AudioServiceConfig;
+  private player: AudioPlayer | undefined;
 
   constructor(config: AudioServiceConfig) {
     this.config = config;
+    this.player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+        maxMissedFrames: Math.round(config.maxTransmissionGap / 20),
+      },
+    });
   }
 
   playTo(connection: VoiceConnection) {
-      return connection.play(new FFmpeg({
+    this.player.stop();
+    
+    this.player.play(createAudioResource(
+      new FFmpeg({
         args: [
           "-analyzeduration",
           "0",
@@ -30,7 +48,13 @@ export class AudioService {
           "-ac",
           "2",
         ],
-      }), {type: "ogg/opus"});
+      }),
+      { inputType: StreamType.OggOpus }
+    ));
+
+    connection.subscribe(this.player);
+
+    return this.player;
   }
 }
 

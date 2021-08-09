@@ -29,6 +29,7 @@ import {
   Message,
   MessageEmbedOptions,
   PartialTextBasedChannelFields,
+  StageChannel,
   VoiceChannel,
 } from "discord.js";
 import Mopidy = require("mopidy");
@@ -55,13 +56,15 @@ mopidyService.onPlay(async function (song: Song) {
       eventType: "query_media",
       uri,
     });
-    const collection = await mediaQuery.channel.awaitMessages(
-      (m: Message) => m.reference.messageID == mediaQuery.id,
-      { max: 1, time: 50000, errors: ["time"] }
-    );
+    const collection = await mediaQuery.channel.awaitMessages({
+      max: 1,
+      time: 50000,
+      errors: ["time"],
+      filter: (m: Message) => m.reference.messageId == mediaQuery.id,
+    });
+
     // Deliberately do this out of band so we're not blocked waiting for the bot response
     const score = collection
-      .array()
       .map(discordService.getJsonPayload)
       .map((p: any) => p && p.media && p.media.score)[0];
     discordService.addScore(currentSongEmbed, score || 0);
@@ -123,7 +126,11 @@ const stop = async function () {
 //   return [song.uri]
 // }
 
-const playTracks = async function (message: Message, tracks: TrackRef[], playNow) {
+const playTracks = async function (
+  message: Message,
+  tracks: TrackRef[],
+  playNow
+) {
   if (!(await joinChannel(message))) {
     return;
   }
@@ -217,23 +224,25 @@ const rand = async function (message, query, playNow) {
   if (isJoinable(message.member.voice.channel, message.channel)) {
     const response = await message.channel.send("Searching...");
 
-    const result = await mopidyService.playlistQuery(query.toLowerCase().split(/\s+/));
+    const result = await mopidyService.playlistQuery(
+      query.toLowerCase().split(/\s+/)
+    );
 
     if (result && result.length > 0) {
       response.delete();
       const idx = Math.floor(Math.random() * result.length);
       return playTracks(message, [result[idx]], playNow);
     } else {
-      response.edit("No beats found.")
+      response.edit("No beats found.");
     }
   }
 };
 
 const isJoinable = function (
-  channel: VoiceChannel,
+  channel: VoiceChannel | StageChannel,
   textChannel: PartialTextBasedChannelFields
 ): channel is VoiceChannel {
-  if (channel && channel.type == "voice") {
+  if (channel && channel.type == "GUILD_VOICE") {
     return true;
   } else {
     textChannel.send("You need to join a voice channel first!");
@@ -250,12 +259,8 @@ const joinChannel = async function (message: Message) {
 
       const dispatcher = audioService.playTo(connection);
 
-      dispatcher.on("start", () => {
-        console.log("audio is now streaming");
-      });
-
-      dispatcher.on("finish", () => {
-        console.log("audio has finished streaming");
+      dispatcher.on("stateChange", (state) => {
+        console.log(`audio is now ${state.status}`);
       });
 
       // Always remember to handle errors appropriately!
