@@ -1,10 +1,4 @@
 import {
-  AudioPlayer,
-  DiscordGatewayAdapterCreator,
-  joinVoiceChannel,
-  VoiceConnection,
-} from "@discordjs/voice/dist";
-import {
   Channel,
   Client,
   EmbedFieldData,
@@ -14,8 +8,12 @@ import {
   MessageEmbedOptions,
   MessageReaction,
   ReactionCollector,
+  Snowflake,
+  TextChannel,
   VoiceChannel,
+  VoiceConnection,
 } from "discord.js";
+import { Song } from "./mopidyService";
 
 const goodReactsList = ["📈", "🎺", "💯", "👌", "👍", "🔥", "🥁"];
 const badReactsList = ["📉", "👎", "🚢", "🚣", "🚤", "⚓", "💩"];
@@ -23,6 +21,10 @@ const goodReacts = new Set(goodReactsList);
 const badReacts = new Set(badReactsList);
 
 const randChoice = (list) => list[Math.floor(Math.random() * list.length)];
+
+const jsonPrefix = "```json";
+const jsonSuffix = "```";
+
 export type Command = {
   action: (message: Message, args: string, bang: string, alt: string) => void;
   description: string;
@@ -35,29 +37,25 @@ export class DiscordService {
   private secret: string;
   private idleTimeout: number;
   private voteTimeout: number;
-  private currentTextChannel: Channel | undefined;
-  private reactCollectors: ReactionCollector[];
+  public currentTextChannel: TextChannel | undefined;
   private currentNumberChoice: {
     timeout: NodeJS.Timeout;
     afterChosen;
     numberCollector;
-    message;
+    message: Message;
   };
   private voiceConnection: VoiceConnection;
-  private currentVoiceChannel: VoiceChannel;
+  public currentVoiceChannel: VoiceChannel;
   private timeout: NodeJS.Timeout;
+  private botChannelId: Snowflake;
+  public currentPlayingMessage: Message;
 
   constructor(config) {
-    this.client = new Client({
-      intents: [
-        Intents.FLAGS.GUILDS,
-        Intents.FLAGS.GUILD_MESSAGES,
-        Intents.FLAGS.GUILD_MESSAGE_REACTIONS,
-      ],
-    });
+    this.client = new Client();
     this.secret = config.discordSecret;
     this.idleTimeout = config.idleTimeoutSeconds * 1000;
     this.voteTimeout = config.voteTimeoutSeconds * 1000;
+    this.botChannelId = config.botChannelId;
   }
 
   onMessage(commands: Record<string, Command>, fallback) {
@@ -84,16 +82,14 @@ export class DiscordService {
 
         const command = commands[cmd];
 
-        if (command) {
+        if (command && message.channel.type == "text") {
           this.currentTextChannel = message.channel;
           return command.action(message, args, bang, alt);
         }
       }
 
       if (fallback) {
-        if (fallback(message, cmd, args, bang)) {
-          this.currentTextChannel = message.channel;
-        }
+        fallback(message, cmd, args, bang);
       }
     });
   }
@@ -118,22 +114,29 @@ export class DiscordService {
       fields,
     };
 
-    message.channel.send({ embeds: [embed] });
+    message.channel.send({ embed });
   }
 
   async startBot() {
     await this.client.login(this.secret);
-    await this.nowPlaying();
+    await this.setIdle();
   }
 
   disconnect() {
     return this.client.destroy();
   }
 
-  postEmbed(embed: MessageEmbedOptions) {
-    if (this.currentTextChannel.isText()) {
-      this.currentTextChannel.send({ embeds: [embed] });
+  async postEmbed(embed: MessageEmbedOptions) {
+    if (this.currentTextChannel && this.currentTextChannel.isText()) {
+      const message = await this.currentTextChannel.send({ embed });
+      this.currentPlayingMessage = message;
+      return message;
     }
+  }
+
+  async addScore(message: Message, score) {
+    const embed = new MessageEmbed(message.embeds[0]).addField("Points", `${score >= 0 ? "🎺" : "⚓"} ${score}`, true);
+    message.edit(embed);
   }
 
   reactionHandler(onReact) {
@@ -155,13 +158,6 @@ export class DiscordService {
       badReacts.has(reaction._emoji.name);
 
     return realUser && knownReact;
-  }
-
-  clearCollectors() {
-    for (var collector of this.reactCollectors) {
-      collector.stop();
-    }
-    this.reactCollectors = [];
   }
 
   emojiForNumber(n) {
@@ -187,7 +183,6 @@ export class DiscordService {
         this.currentNumberChoice;
       clearTimeout(timeout);
       numberCollector.stop();
-      await message.clearReactions();
 
       if (reaction && reaction.emoji.name !== "❌") {
         // A number was chosen, so we must handle the response.
@@ -231,23 +226,94 @@ export class DiscordService {
     }
   }
 
-  async nowPlaying(text?: string) {
-    if (text) {
-      console.log("now playing", text);
-      await this.client.user.setPresence({
-        status: "online",
-        activities: [
-          {
-            name: text,
-            type: "LISTENING",
-          },
-        ],
-      });
-    } else {
-      await this.client.user.setPresence({
-        status: "idle",
-      });
+  async nowPlaying(song: Song, embedMessage?: Message) {
+    await this.client.user.setPresence({
+      status: "online",
+    });
+    await this.client.user.setActivity({
+      name: song.name,
+      type: "PLAYING",
+    });
+
+    if(embedMessage) {
+      const {uri, tags} = this.normaliseUri(song.uri);
+      await this.sendBotPayload({
+          eventType: "media_posted",
+          tags: ["beat", "beats", ...tags],
+          uri,
+          description: song.name,
+          messageId: embedMessage.id,
+          channelId: embedMessage.channel.id,
+          link: `https://beatsbot.one/play?uri=${encodeURIComponent(uri)}`
+      })
     }
+    
+    if(this.timeout) {
+      clearTimeout(this.timeout);
+    }
+  }
+
+  async sendBotPayload(payload: object): Promise<Message | undefined> {
+    const botChannel = this.client.channels.cache.get(this.botChannelId)
+    if(botChannel.isText()) {
+      return botChannel.send({
+        content: [jsonPrefix, JSON.stringify(payload, null, 2), jsonSuffix].join("\n")
+      })
+    }
+  }
+
+  getJsonPayload(message: Message): unknown | undefined {
+    if(message.content.startsWith(jsonPrefix) && message.content.endsWith(jsonSuffix)) {
+      try {
+        return JSON.parse(message.content.substring(jsonPrefix.length, message.content.length - jsonSuffix.length));
+      }
+      catch {}
+    };
+  }
+
+  normaliseUri(uri: string): {uri: string, tags: string[]} {
+    const browseLocalPrefix = "file:///home/rory/Dropbox/Chatsongs/"
+    const localPrefix = "local:track:"
+    
+    const isBrowseLocal = uri.startsWith(browseLocalPrefix);
+    const isLocal = uri.startsWith(localPrefix)
+    if(isBrowseLocal || isLocal) {
+      const path = isBrowseLocal ? uri.substr(browseLocalPrefix.length) : uri.substr(localPrefix.length);
+      const tags = path.split("/").slice(0, -1).map(s => decodeURIComponent(s).split(" ")[0].toLowerCase());
+      return {
+        uri: `${localPrefix}${path}`,
+        tags
+      }
+    } else {
+      return {uri, tags: []}
+    }
+  }
+
+  async setIdle() {
+    await this.client.user.setPresence({
+      status: "idle",
+    });
+    await this.client.user.setActivity({
+      name: "!play",
+      type: "LISTENING",
+    });
+    this.voiceConnection.player;
+    this.resetTimeout();
+  }
+
+  async resetTimeout() {
+    if(this.timeout) {
+      clearTimeout(this.timeout);
+    }
+
+    this.timeout = setTimeout(
+      this.leaveVoiceChannel.bind(this),
+      this.idleTimeout
+    );
+  }
+
+  async inVoice() {
+    return !!this.voiceConnection
   }
 
   async joinVoiceChannel(channel: VoiceChannel) {
@@ -258,21 +324,15 @@ export class DiscordService {
       this.leaveVoiceChannel();
     }
 
-    clearTimeout(this.timeout);
+    if(this.timeout) {
+      clearTimeout(this.timeout);
+    }
     this.currentVoiceChannel = channel;
 
     if (!this.voiceConnection) {
-      this.voiceConnection = await joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-      });
-    }
-
-    this.timeout = setTimeout(
-      this.leaveVoiceChannel.bind(this),
-      this.idleTimeout
-    );
+      this.voiceConnection = await channel.join();
+    }  
+    this.resetTimeout();
   }
 
   async leaveVoiceChannel() {
@@ -281,34 +341,16 @@ export class DiscordService {
     this.currentVoiceChannel = null;
   }
 
-  async startAudio(channel: VoiceChannel, audioPlayer: AudioPlayer) {
-    await this.joinVoiceChannel(channel);
-    console.log("SUBSCRIBING VOICE CONNECTION");
-    this.voiceConnection.subscribe(audioPlayer);
-    console.log(audioPlayer.state);
-    console.log(this.voiceConnection.state);
+  async startAudio(channel: VoiceChannel) {
+    if(channel != this.currentVoiceChannel) {
+      await this.joinVoiceChannel(channel);
+    }
+    return this.voiceConnection;
   }
-
-  // async streamAudio(stream, name?) {
-  //   if (this.voiceConnection) {
-  //     if (name) {
-  //       await this.nowPlaying(name);
-  //     }
-  //     clearTimeout(this.timeout);
-  //     // if (!(this.currentStream && this.currentStream.playing)) {
-  //     //   this.currentStream = stream;
-  //     //   try {
-  //     //     this.voiceConnection.playConvertedStream(stream);
-  //     //   } catch (e) {
-  //     //     console.log("failed to start audio stream", e);
-  //     //   }
-  //     // }
-  //   }
-  // }
 
   async stopAudio() {
     clearTimeout(this.timeout);
-    this.nowPlaying();
+    this.setIdle();
     this.timeout = setTimeout(
       this.leaveVoiceChannel.bind(this),
       this.idleTimeout

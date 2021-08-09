@@ -1,4 +1,4 @@
-import AsciiTable from "ascii-table";
+import * as AsciiTable from "ascii-table";
 import { handleMessage } from "./custom";
 
 const config = {
@@ -15,15 +15,25 @@ const config = {
   mopidyWsUrl: process.env.MOPIDY_WS_URL || "ws://mopidy:6680/mopidy/ws/",
   idleTimeoutSeconds: process.env.IDLE_TIMEOUT_SECONDS || 60,
   voteTimeoutSeconds: process.env.VOTE_TIMEOUT_SECONDS || 60,
-  maxTransmissionGap: parseInt(process.env.MAX_TRANSMISSION_GAP || "") || 500000,
+  maxTransmissionGap:
+    parseInt(process.env.MAX_TRANSMISSION_GAP || "") || 500000,
   audioDevice: process.env.AUDIO_DEVICE,
+  botChannelId: process.env.BOT_CHANNEL_ID,
 };
 
 import DiscordService from "./services/discordService";
-import MopidyService, { Song } from "./services/mopidyService";
+import MopidyService, { Song, Track, TrackRef } from "./services/mopidyService";
 
 import AudioService from "./services/audioService";
-import { Message, MessageEmbedOptions, PartialTextBasedChannelFields, StageChannel, TextBasedChannelFields, TextChannel, VoiceChannel } from "discord.js";
+import {
+  Message,
+  MessageEmbedOptions,
+  PartialTextBasedChannelFields,
+  VoiceChannel,
+} from "discord.js";
+import Mopidy = require("mopidy");
+import { createServer, IncomingMessage, ServerResponse } from "http";
+import { parse } from "querystring";
 
 const discordService = new DiscordService(config);
 const mopidyService = new MopidyService(config);
@@ -33,12 +43,29 @@ const maxMessageLength = 2000;
 const maxBeats = 100;
 const maxResults = 10;
 
-mopidyService.onPlay(async function (song, stream) {
-  // await discordService.streamAudio(stream, song.derived.songString);
-
+mopidyService.onPlay(async function (song: Song) {
   // Configure new song
-  const embed = await songEmbed(mopidyService.deriveSongFields(song));
-  const currentSongEmbed = await discordService.postEmbed(embed);
+  if (discordService.inVoice()) {
+    const embed = await songEmbed(mopidyService.deriveSongFields(song));
+    const currentSongEmbed = await discordService.postEmbed(embed);
+    const { uri } = discordService.normaliseUri(song.uri);
+    await discordService.nowPlaying(song, currentSongEmbed);
+
+    const mediaQuery = await discordService.sendBotPayload({
+      eventType: "query_media",
+      uri,
+    });
+    const collection = await mediaQuery.channel.awaitMessages(
+      (m: Message) => m.reference.messageID == mediaQuery.id,
+      { max: 1, time: 50000, errors: ["time"] }
+    );
+    // Deliberately do this out of band so we're not blocked waiting for the bot response
+    const score = collection
+      .array()
+      .map(discordService.getJsonPayload)
+      .map((p: any) => p && p.media && p.media.score)[0];
+    discordService.addScore(currentSongEmbed, score || 0);
+  }
 });
 
 mopidyService.onStop(async function (song) {
@@ -46,8 +73,19 @@ mopidyService.onStop(async function (song) {
   await stop();
 });
 
+mopidyService.onQueue(async (track) => {
+  if (discordService.currentTextChannel && discordService.currentVoiceChannel) {
+    await discordService.currentTextChannel.send(
+      `Queued ${mopidyService.deriveSongFields(track).derived.songName}`
+    );
+  }
+});
+
 const songEmbed = async function (song: Song): Promise<MessageEmbedOptions> {
   const image = await mopidyService.getImage(song);
+
+  const thumbnail =
+    image && image.startsWith("http") ? { url: image } : undefined;
 
   return {
     title: "Now Playing",
@@ -64,7 +102,7 @@ const songEmbed = async function (song: Song): Promise<MessageEmbedOptions> {
       },
     ],
     color: "#08d58f",
-    thumbnail: image,
+    thumbnail,
   };
 };
 
@@ -85,22 +123,22 @@ const stop = async function () {
 //   return [song.uri]
 // }
 
-const playSong = async function (message, song, playNow) {
+const playTracks = async function (message: Message, tracks: TrackRef[], playNow) {
   if (!(await joinChannel(message))) {
     return;
   }
 
   // const normalised = await normaliseSpotifyPlaylists(song)
-  const playingNow = await mopidyService.playSong(song, playNow);
+  const playingNow = await mopidyService.playTracks(tracks, playNow);
+};
 
-  if (!playingNow) {
-    await message.channel.send(
-      `Queued ${
-        mopidyService.deriveSongFields(song).derived.songName ||
-        song.uri.split(":")[1]
-      }`
-    );
+const playUri = async function (message: Message, uri: string, playNow) {
+  if (!(await joinChannel(message))) {
+    return;
   }
+
+  // const normalised = await normaliseSpotifyPlaylists(song)
+  const playingNow = await mopidyService.playUri(uri, playNow);
 };
 
 const songChoice = async function (message, response, songs, playNow, n?) {
@@ -110,7 +148,7 @@ const songChoice = async function (message, response, songs, playNow, n?) {
   }
 
   if (n && n < songs.length) {
-    playSong(message, songs[n], playNow);
+    playTracks(message, [songs[n]], playNow);
   }
 
   const songsWithPoints = await Promise.all(
@@ -126,7 +164,7 @@ const songChoice = async function (message, response, songs, playNow, n?) {
     choiceMessage,
     songsWithPoints.length,
     (number) => {
-      return playSong(message, songs[number], playNow);
+      return playTracks(message, [songs[number]], playNow);
     }
   );
 };
@@ -135,25 +173,24 @@ const youtubeUrlRegex = new RegExp(
   "(https?:\\/\\/)?(www.)?youtu(\\.be|be\\.com).*"
 );
 
-const searchPriorities = ["local", "spotify"];
+const searchPriorities = ["local", "spotify", "youtube"];
 
-const play = async function (message, query, playNow, number) {
+const play = async function (message: Message, query, playNow, number) {
   console.log(number);
   if (isJoinable(message.member.voice.channel, message.channel)) {
     if (youtubeUrlRegex.test(query)) {
-      return playSong(message, { uri: `yt:${query}` }, playNow);
+      return playUri(message, `yt:${query}`, playNow);
     } else if (query.startsWith("spotify:")) {
-      return playSong(message, { uri: query }, playNow);
+      return playUri(message, query, playNow);
     } else if (query.startsWith("https://open.spotify.com")) {
-      return playSong(
+      return playUri(
         message,
-        { uri: `spotify${query.substring(24).split("/").join(":")}` },
+        `spotify${query.substring(24).split("/").join(":")}`,
         playNow
       );
     } else {
       const response = await message.channel.send("Searching...");
 
-      let tracks = [];
       const queryArgs = query.split(" ");
 
       for (const songSource of searchPriorities) {
@@ -164,18 +201,14 @@ const play = async function (message, query, playNow, number) {
           sourceResults.tracks &&
           sourceResults.tracks.length > 0
         ) {
-          if (sourceResults.tracks.length === 1) {
+          if (sourceResults.tracks.length >= 1) {
             response.delete();
-            return playSong(message, sourceResults.tracks[0], playNow);
-          } else {
-            tracks = [...tracks, ...sourceResults.tracks];
+            return playTracks(message, [sourceResults.tracks[0]], playNow);
           }
-
-          if (tracks.length >= maxResults) break;
         }
       }
 
-      return songChoice(message, response, tracks, playNow, number);
+      response.edit("No results found.");
     }
   }
 };
@@ -184,21 +217,23 @@ const rand = async function (message, query, playNow) {
   if (isJoinable(message.member.voice.channel, message.channel)) {
     const response = await message.channel.send("Searching...");
 
-    for (const songSource of searchPriorities) {
-      const sourceResults = await mopidyService.search(query, songSource);
-      if (sourceResults.tracks && sourceResults.tracks.length) {
-        response.delete();
-        const idx = Math.floor(Math.random() * sourceResults.tracks.length);
-        return playSong(message, sourceResults.tracks[idx], playNow);
-      }
-    }
+    const result = await mopidyService.playlistQuery(query.toLowerCase().split(/\s+/));
 
-    response.edit("No results found.");
+    if (result && result.length > 0) {
+      response.delete();
+      const idx = Math.floor(Math.random() * result.length);
+      return playTracks(message, [result[idx]], playNow);
+    } else {
+      response.edit("No beats found.")
+    }
   }
 };
 
-const isJoinable = function (channel: VoiceChannel | StageChannel, textChannel: PartialTextBasedChannelFields): channel is VoiceChannel {
-  if (channel && channel.type == 'voice') {
+const isJoinable = function (
+  channel: VoiceChannel,
+  textChannel: PartialTextBasedChannelFields
+): channel is VoiceChannel {
+  if (channel && channel.type == "voice") {
     return true;
   } else {
     textChannel.send("You need to join a voice channel first!");
@@ -210,7 +245,22 @@ const joinChannel = async function (message: Message) {
   const channel = message.member.voice.channel;
   console.log(channel);
   if (isJoinable(channel, message.channel)) {
-    await discordService.startAudio(channel, audioService.getPlayer());
+    if (discordService.currentVoiceChannel != channel) {
+      const connection = await discordService.startAudio(channel);
+
+      const dispatcher = audioService.playTo(connection);
+
+      dispatcher.on("start", () => {
+        console.log("audio is now streaming");
+      });
+
+      dispatcher.on("finish", () => {
+        console.log("audio has finished streaming");
+      });
+
+      // Always remember to handle errors appropriately!
+      dispatcher.on("error", console.error);
+    }
     return true;
   }
   return false;
@@ -233,17 +283,17 @@ const beatsTable = function (title, beats, params?) {
   if (beats.length === 0) {
     return ["No results."];
   }
-  const table = new AsciiTable().setHeading("#", "Name", "Artist(s)", "Score");
+  const table = new AsciiTable().setHeading("#", "Name", "Artist(s)");
 
   beats.forEach((song, i) => {
     const num = i + 1 + (first || 0);
     table.addRow(
       index === i ? `> ${num}` : num,
       ellipse(song.derived.songName, 60),
-      ellipse(song.derived.artistString, 40),
-      song.points
+      ellipse(song.derived.artistString, 40)
     );
   });
+
   const tableLines = table.toString().split("\n");
 
   let message = `**${title}**\n`;
@@ -301,6 +351,29 @@ const repeat = async function (message, args, thisSong) {
   }
 };
 
+const upvote = async (message: Message) => vote(message, 1);
+const downvote = async (message: Message) => vote(message, -1);
+
+const vote = async (message: Message, delta: number) => {
+  if (
+    mopidyService.playing &&
+    discordService.currentPlayingMessage &&
+    mopidyService.currentSong
+  ) {
+    await discordService.sendBotPayload({
+      eventType: "media_posted",
+      tags: ["beat"],
+      uri: mopidyService.currentSong.uri,
+      description: mopidyService.currentSong.name,
+      messageId: message.id,
+      channelId: message.channel.id,
+      voteFrom: message.author.id,
+      parentMessage: discordService.currentPlayingMessage.id,
+      initialSentiment: delta,
+    });
+  }
+};
+
 const commands = {
   stop: {
     action: stop,
@@ -332,6 +405,14 @@ const commands = {
     description:
       "List the most recent 5 songs played. You may select one to play.",
   },
+  upvote: {
+    action: upvote,
+    description: "Upvote the currently playing song.",
+  },
+  downvote: {
+    action: downvote,
+    description: "Downvote the currently playing song.",
+  },
   repeat: {
     action: repeat,
     description: "Play the current tracklist on repeat.",
@@ -353,9 +434,27 @@ discordService.onMessage(commands, async (message, cmd, args, bang) => {
   if (action) {
     console.log(action);
     if (action.reply) message.channel.send(action.reply);
-    if (action.play) playSong(message, { uri: action.play }, action.bang);
+    if (action.play) playUri(message, action.play, action.bang);
+    if (action.vote) vote(message, action.vote);
     return true;
   }
 });
+
+const port = 5000;
+
+const server = createServer(
+  async (request: IncomingMessage, response: ServerResponse) => {
+    const { uri } = parse(request.url.slice(request.url.indexOf("?") + 1));
+    if (uri && !Array.isArray(uri)) {
+      await mopidyService.playUri(uri, false);
+    }
+    response.writeHead(302, {
+      Location: "https://beatsbot.one/iris/queue",
+    });
+    response.end();
+  }
+);
+
+server.listen(port);
 
 discordService.startBot();
