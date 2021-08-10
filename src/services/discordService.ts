@@ -1,3 +1,4 @@
+import { joinVoiceChannel, VoiceConnection } from "@discordjs/voice";
 import {
   Channel,
   Client,
@@ -9,9 +10,9 @@ import {
   MessageReaction,
   ReactionCollector,
   Snowflake,
+  TextBasedChannels,
   TextChannel,
   VoiceChannel,
-  VoiceConnection,
 } from "discord.js";
 import { Song } from "./mopidyService";
 
@@ -37,7 +38,7 @@ export class DiscordService {
   private secret: string;
   private idleTimeout: number;
   private voteTimeout: number;
-  public currentTextChannel: TextChannel | undefined;
+  public currentTextChannel: TextBasedChannels | undefined;
   private currentNumberChoice: {
     timeout: NodeJS.Timeout;
     afterChosen;
@@ -51,7 +52,7 @@ export class DiscordService {
   public currentPlayingMessage: Message;
 
   constructor(config) {
-    this.client = new Client();
+    this.client = new Client({intents: ["GUILD_MESSAGES", "GUILD_MESSAGE_REACTIONS", "GUILD_VOICE_STATES"]});
     this.secret = config.discordSecret;
     this.idleTimeout = config.idleTimeoutSeconds * 1000;
     this.voteTimeout = config.voteTimeoutSeconds * 1000;
@@ -82,7 +83,7 @@ export class DiscordService {
 
         const command = commands[cmd];
 
-        if (command && message.channel.type == "text") {
+        if (command && message.channel.isText()) {
           this.currentTextChannel = message.channel;
           return command.action(message, args, bang, alt);
         }
@@ -114,7 +115,7 @@ export class DiscordService {
       fields,
     };
 
-    message.channel.send({ embed });
+    message.channel.send({ embeds: [embed] });
   }
 
   async startBot() {
@@ -128,7 +129,7 @@ export class DiscordService {
 
   async postEmbed(embed: MessageEmbedOptions) {
     if (this.currentTextChannel && this.currentTextChannel.isText()) {
-      const message = await this.currentTextChannel.send({ embed });
+      const message = await this.currentTextChannel.send({ embeds: [embed] });
       this.currentPlayingMessage = message;
       return message;
     }
@@ -136,7 +137,7 @@ export class DiscordService {
 
   async addScore(message: Message, score) {
     const embed = new MessageEmbed(message.embeds[0]).addField("Points", `${score >= 0 ? "🎺" : "⚓"} ${score}`, true);
-    message.edit(embed);
+    message.edit({embeds: [embed]});
   }
 
   reactionHandler(onReact) {
@@ -297,7 +298,6 @@ export class DiscordService {
       name: "!play",
       type: "LISTENING",
     });
-    this.voiceConnection.player;
     this.resetTimeout();
   }
 
@@ -307,7 +307,7 @@ export class DiscordService {
     }
 
     this.timeout = setTimeout(
-      this.leaveVoiceChannel.bind(this),
+      this.stopVoice.bind(this),
       this.idleTimeout
     );
   }
@@ -316,12 +316,12 @@ export class DiscordService {
     return !!this.voiceConnection
   }
 
-  async joinVoiceChannel(channel: VoiceChannel) {
+  async startVoice(channel: VoiceChannel) {
     if (
       this.voiceConnection &&
       (!this.currentVoiceChannel || this.currentVoiceChannel.id !== channel.id)
     ) {
-      this.leaveVoiceChannel();
+      this.stopVoice();
     }
 
     if(this.timeout) {
@@ -330,20 +330,24 @@ export class DiscordService {
     this.currentVoiceChannel = channel;
 
     if (!this.voiceConnection) {
-      this.voiceConnection = await channel.join();
+      this.voiceConnection = await joinVoiceChannel({
+        channelId: channel.id,
+        guildId: channel.guildId,
+        adapterCreator: channel.guild.voiceAdapterCreator
+      });
     }  
     this.resetTimeout();
   }
 
-  async leaveVoiceChannel() {
-    if (this.voiceConnection) this.voiceConnection.disconnect();
+  async stopVoice() {
+    if (this.voiceConnection) this.voiceConnection.destroy();
     this.voiceConnection = null;
     this.currentVoiceChannel = null;
   }
 
   async startAudio(channel: VoiceChannel) {
     if(channel != this.currentVoiceChannel) {
-      await this.joinVoiceChannel(channel);
+      await this.startVoice(channel);
     }
     return this.voiceConnection;
   }
@@ -352,7 +356,7 @@ export class DiscordService {
     clearTimeout(this.timeout);
     this.setIdle();
     this.timeout = setTimeout(
-      this.leaveVoiceChannel.bind(this),
+      this.stopVoice.bind(this),
       this.idleTimeout
     );
   }
