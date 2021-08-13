@@ -1,4 +1,4 @@
-import { joinVoiceChannel, VoiceConnection } from "@discordjs/voice";
+import { joinVoiceChannel, VoiceConnection, VoiceConnectionStatus } from "@discordjs/voice";
 import {
   Channel,
   Client,
@@ -50,13 +50,24 @@ export class DiscordService {
   private timeout: NodeJS.Timeout;
   private botChannelId: Snowflake;
   public currentPlayingMessage: Message;
+  private afterPlayedEmbed?: MessageEmbedOptions;
+  private queuedMessage?: Message;
+  private queuedLength: number;
 
   constructor(config) {
-    this.client = new Client({intents: ["GUILD_MESSAGES", "GUILD_MESSAGE_REACTIONS", "GUILD_VOICE_STATES"]});
+    this.client = new Client({
+      intents: [
+        "GUILDS",
+        "GUILD_MESSAGES",
+        "GUILD_MESSAGE_REACTIONS",
+        "GUILD_VOICE_STATES",
+      ],
+    });
     this.secret = config.discordSecret;
     this.idleTimeout = config.idleTimeoutSeconds * 1000;
     this.voteTimeout = config.voteTimeoutSeconds * 1000;
     this.botChannelId = config.botChannelId;
+    this.queuedLength = 0;
   }
 
   onMessage(commands: Record<string, Command>, fallback) {
@@ -126,18 +137,43 @@ export class DiscordService {
   disconnect() {
     return this.client.destroy();
   }
+  
+  async songEnd() {
+    await this.shrinkPlayingMessage();
+  }
 
-  async postEmbed(embed: MessageEmbedOptions) {
+  async postEmbed(embed: MessageEmbedOptions, shrinkTo?: MessageEmbedOptions) {
+    const queuedThread = this.queuedMessage?.thread;
+    if(queuedThread) {
+      queuedThread.setArchived(true);
+    }
+    this.queuedMessage = undefined;
     if (this.currentTextChannel && this.currentTextChannel.isText()) {
       const message = await this.currentTextChannel.send({ embeds: [embed] });
+
       this.currentPlayingMessage = message;
+      this.afterPlayedEmbed = shrinkTo;
       return message;
     }
   }
 
+  async shrinkPlayingMessage() {
+    if (this.currentPlayingMessage && this.afterPlayedEmbed) {
+      await this.currentPlayingMessage.edit({
+        embeds: [this.afterPlayedEmbed],
+      });
+
+      this.afterPlayedEmbed = undefined;
+    }
+  }
+
   async addScore(message: Message, score) {
-    const embed = new MessageEmbed(message.embeds[0]).addField("Points", `${score >= 0 ? "🎺" : "⚓"} ${score}`, true);
-    message.edit({embeds: [embed]});
+    const embed = new MessageEmbed(message.embeds[0]).addField(
+      "Points",
+      `${score >= 0 ? "🎺" : "⚓"} ${score}`,
+      true
+    );
+    message.edit({ embeds: [embed] });
   }
 
   reactionHandler(onReact) {
@@ -227,74 +263,112 @@ export class DiscordService {
     }
   }
 
-  async nowPlaying(song: Song, embedMessage?: Message) {
-    await this.client.user.setPresence({
+  async songQueued(song: Song, embed: MessageEmbedOptions) {
+    let thread = this.queuedMessage?.thread;
+    if(thread) {
+      this.queuedLength ++;
+      await thread.edit({ name: `Queued ${this.queuedLength} beats`})
+    } else if(this.currentTextChannel) {
+      this.queuedLength = 1;
+      this.queuedMessage = await this.currentTextChannel.send("_ _");
+      thread = await this.queuedMessage.startThread({
+        name: "Queued a beat",
+        autoArchiveDuration: 60
+      })
+    }
+
+    await thread.send({content: song.derived.songString, embeds: [embed]});
+  }
+
+  async nowPlaying(
+    song: Song,
+    embedMessage?: Message,
+    beatEmbed?: MessageEmbedOptions
+  ) {
+    await this.client.user?.setPresence({
       status: "online",
     });
-    await this.client.user.setActivity({
+    await this.client.user?.setActivity({
       name: song.name,
       type: "PLAYING",
     });
 
-    if(embedMessage) {
-      const {uri, tags} = this.normaliseUri(song.uri);
+    if (embedMessage) {
+      const { uri, tags } = this.normaliseUri(song.uri);
       await this.sendBotPayload({
-          eventType: "media_posted",
-          tags: ["beat", "beats", ...tags],
-          uri,
-          description: song.name,
-          messageId: embedMessage.id,
-          channelId: embedMessage.channel.id,
-          link: `https://beatsbot.one/play?uri=${encodeURIComponent(uri)}`
-      })
+        eventType: "media_posted",
+        tags: ["beat", "beats", ...tags],
+        uri,
+        embed: beatEmbed,
+        description: song.name,
+        messageId: embedMessage.id,
+        channelId: embedMessage.channel.id,
+        link: `https://beatsbot.one/play?uri=${encodeURIComponent(uri)}`,
+      });
     }
-    
-    if(this.timeout) {
+
+    if (this.timeout) {
       clearTimeout(this.timeout);
     }
   }
 
   async sendBotPayload(payload: object): Promise<Message | undefined> {
-    const botChannel = this.client.channels.cache.get(this.botChannelId)
-    if(botChannel.isText()) {
+    const botChannel = this.client.channels.cache.get(this.botChannelId);
+    if (botChannel?.isText()) {
       return botChannel.send({
-        content: [jsonPrefix, JSON.stringify(payload, null, 2), jsonSuffix].join("\n")
-      })
+        content: [
+          jsonPrefix,
+          JSON.stringify(payload, null, 2),
+          jsonSuffix,
+        ].join("\n"),
+      });
     }
   }
 
   getJsonPayload(message: Message): unknown | undefined {
-    if(message.content.startsWith(jsonPrefix) && message.content.endsWith(jsonSuffix)) {
+    if (
+      message.content.startsWith(jsonPrefix) &&
+      message.content.endsWith(jsonSuffix)
+    ) {
       try {
-        return JSON.parse(message.content.substring(jsonPrefix.length, message.content.length - jsonSuffix.length));
-      }
-      catch {}
-    };
+        return JSON.parse(
+          message.content.substring(
+            jsonPrefix.length,
+            message.content.length - jsonSuffix.length
+          )
+        );
+      } catch {}
+    }
   }
 
-  normaliseUri(uri: string): {uri: string, tags: string[]} {
-    const browseLocalPrefix = "file:///home/rory/Dropbox/Chatsongs/"
-    const localPrefix = "local:track:"
-    
+  normaliseUri(uri: string): { uri: string; tags: string[] } {
+    const browseLocalPrefix = "file:///home/rory/Dropbox/Chatsongs/";
+    const localPrefix = "local:track:";
+
     const isBrowseLocal = uri.startsWith(browseLocalPrefix);
-    const isLocal = uri.startsWith(localPrefix)
-    if(isBrowseLocal || isLocal) {
-      const path = isBrowseLocal ? uri.substr(browseLocalPrefix.length) : uri.substr(localPrefix.length);
-      const tags = path.split("/").slice(0, -1).map(s => decodeURIComponent(s).split(" ")[0].toLowerCase());
+    const isLocal = uri.startsWith(localPrefix);
+    if (isBrowseLocal || isLocal) {
+      const path = isBrowseLocal
+        ? uri.substr(browseLocalPrefix.length)
+        : uri.substr(localPrefix.length);
+      const tags = path
+        .split("/")
+        .slice(0, -1)
+        .map((s) => decodeURIComponent(s).split(" ")[0].toLowerCase());
       return {
         uri: `${localPrefix}${path}`,
-        tags
-      }
+        tags,
+      };
     } else {
-      return {uri, tags: []}
+      return { uri, tags: [] };
     }
   }
 
   async setIdle() {
-    await this.client.user.setPresence({
+    await this.client.user?.setPresence({
       status: "idle",
     });
-    await this.client.user.setActivity({
+    await this.client.user?.setActivity({
       name: "!play",
       type: "LISTENING",
     });
@@ -302,18 +376,15 @@ export class DiscordService {
   }
 
   async resetTimeout() {
-    if(this.timeout) {
+    if (this.timeout) {
       clearTimeout(this.timeout);
     }
 
-    this.timeout = setTimeout(
-      this.stopVoice.bind(this),
-      this.idleTimeout
-    );
+    this.timeout = setTimeout(this.stopVoice.bind(this), this.idleTimeout);
   }
 
-  async inVoice() {
-    return !!this.voiceConnection
+  inVoice() {
+    return this.voiceConnection && this.voiceConnection.state.status === VoiceConnectionStatus.Ready;
   }
 
   async startVoice(channel: VoiceChannel) {
@@ -324,7 +395,7 @@ export class DiscordService {
       this.stopVoice();
     }
 
-    if(this.timeout) {
+    if (this.timeout) {
       clearTimeout(this.timeout);
     }
     this.currentVoiceChannel = channel;
@@ -333,9 +404,9 @@ export class DiscordService {
       this.voiceConnection = await joinVoiceChannel({
         channelId: channel.id,
         guildId: channel.guildId,
-        adapterCreator: channel.guild.voiceAdapterCreator
+        adapterCreator: channel.guild.voiceAdapterCreator,
       });
-    }  
+    }
     this.resetTimeout();
   }
 
@@ -343,10 +414,11 @@ export class DiscordService {
     if (this.voiceConnection) this.voiceConnection.destroy();
     this.voiceConnection = null;
     this.currentVoiceChannel = null;
+    this.currentTextChannel = undefined;
   }
 
   async startAudio(channel: VoiceChannel) {
-    if(channel != this.currentVoiceChannel) {
+    if (channel != this.currentVoiceChannel) {
       await this.startVoice(channel);
     }
     return this.voiceConnection;
@@ -355,10 +427,7 @@ export class DiscordService {
   async stopAudio() {
     clearTimeout(this.timeout);
     this.setIdle();
-    this.timeout = setTimeout(
-      this.stopVoice.bind(this),
-      this.idleTimeout
-    );
+    this.timeout = setTimeout(this.stopVoice.bind(this), this.idleTimeout);
   }
 }
 

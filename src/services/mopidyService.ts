@@ -1,14 +1,23 @@
 import * as Mopidy from "mopidy";
 import { countBy, groupBy } from "lodash";
+import { MessageEmbedOptions } from "discord.js";
 
 export type TrackRef = {
   name: string;
   uri: string;
 };
+export type Track = Mopidy.models.Track
 
-export type Track = Mopidy.models.Track;
+export type MaybeSong = Mopidy.models.Track & {
+  derived?: {
+    artistString: string;
+    songName: string;
+    songString: string;
+    durationString: string;
+  }
+};
 
-export type Song = Track & {
+export type Song = Mopidy.models.Track & {
   derived: {
     artistString: string;
     songName: string;
@@ -89,7 +98,11 @@ export class MopidyService {
     this.client = null;
   }
 
-  deriveSongFields(song: Mopidy.models.Track): Song {
+  deriveSongFields(song: MaybeSong): Song {
+    if(song.derived !== undefined) {
+      return song as Song;
+    }
+
     let artistString = song.artists
       ? song.artists.map((a) => a.name).join(", ")
       : "Unknown Artist";
@@ -132,7 +145,7 @@ export class MopidyService {
 
     const derived = { artistString, songName, songString, durationString };
 
-    return Object.assign({ derived }, song);
+    return { ...song, derived };
   }
 
   async getSong(uri, points) {
@@ -319,6 +332,58 @@ export class MopidyService {
     });
     return result[0];
   }
+  
+  async beatEmbeds(beat: Song | Track) {
+    const song = this.deriveSongFields(beat);
+    const image = await this.getImage(song);
+  
+    const iconURL = image && image.startsWith("http") ? image : undefined;
+  
+    const thumbnail = iconURL ? { url: iconURL } : undefined;
+  
+    const nowPlaying: MessageEmbedOptions = {
+      title: "Now Playing",
+      url: "https://beatsbot.one/iris/queue",
+      fields: [
+        {
+          name: song.derived.songName,
+          value: song.derived.artistString,
+        },
+        {
+          name: "Duration",
+          value: song.derived.durationString,
+          inline: true,
+        },
+      ],
+      color: "#08d58f",
+      thumbnail,
+    };
+  
+    const action = (action?: string): MessageEmbedOptions => ({
+      footer: {
+        iconURL,
+        text: action ? `${action} ${song.derived.songString}` : song.derived.songString,
+      },
+      color: "#08d58f",
+    });
+  
+    const simple: MessageEmbedOptions = {
+      title: song.derived.songName,
+      description: song.derived.artistString,
+      url: `https://beatsbot.one/play?uri=${encodeURIComponent(song.uri)}`,
+      fields: [
+        {
+          name: "Duration",
+          value: song.derived.durationString,
+          inline: true,
+        },
+      ],
+      color: "#08d58f",
+      thumbnail,
+    };
+  
+    return { nowPlaying, action, simple };
+  };
 }
 
 export default MopidyService;
