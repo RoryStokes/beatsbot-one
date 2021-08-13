@@ -45,22 +45,28 @@ const maxBeats = 100;
 const maxResults = 10;
 
 mopidyService.onPlay(async function (song: Song) {
+  await discordService.songEnd();
+
   // Configure new song
   if (discordService.inVoice()) {
-    const embed = await songEmbed(mopidyService.deriveSongFields(song));
-    const currentSongEmbed = await discordService.postEmbed(embed);
+    const embeds = await beatEmbed(mopidyService.deriveSongFields(song));
+    const currentSongEmbed = await discordService.postEmbed(
+      embeds.nowPlaying,
+      embeds.action("Played")
+    );
     const { uri } = discordService.normaliseUri(song.uri);
-    await discordService.nowPlaying(song, currentSongEmbed);
+    await discordService.nowPlaying(song, currentSongEmbed, embeds.simple);
 
     const mediaQuery = await discordService.sendBotPayload({
       eventType: "query_media",
       uri,
     });
+
     const collection = await mediaQuery.channel.awaitMessages({
       max: 1,
       time: 50000,
       errors: ["time"],
-      filter: (m: Message) => m.reference.messageId == mediaQuery.id,
+      filter: (m: Message) => m.reference?.messageId == mediaQuery.id,
     });
 
     // Deliberately do this out of band so we're not blocked waiting for the bot response
@@ -72,25 +78,26 @@ mopidyService.onPlay(async function (song: Song) {
 });
 
 mopidyService.onStop(async function (song) {
-  discordService.stopAudio();
+  await discordService.songEnd();
+  await discordService.stopAudio();
   await stop();
 });
 
 mopidyService.onQueue(async (track) => {
-  if (discordService.currentTextChannel && discordService.currentVoiceChannel) {
-    await discordService.currentTextChannel.send(
-      `Queued ${mopidyService.deriveSongFields(track).derived.songName}`
-    );
-  }
+  const song = mopidyService.deriveSongFields(track);
+  const embeds = await mopidyService.beatEmbeds(song);
+
+  await discordService.songQueued(song, embeds.simple);
 });
 
-const songEmbed = async function (song: Song): Promise<MessageEmbedOptions> {
+const beatEmbed = async function (song: Song) {
   const image = await mopidyService.getImage(song);
 
-  const thumbnail =
-    image && image.startsWith("http") ? { url: image } : undefined;
+  const iconURL = image && image.startsWith("http") ? image : undefined;
 
-  return {
+  const thumbnail = iconURL ? { url: iconURL } : undefined;
+
+  const nowPlaying: MessageEmbedOptions = {
     title: "Now Playing",
     url: config.externalUrl,
     fields: [
@@ -107,6 +114,31 @@ const songEmbed = async function (song: Song): Promise<MessageEmbedOptions> {
     color: "#08d58f",
     thumbnail,
   };
+
+  const action = (action: string): MessageEmbedOptions => ({
+    footer: {
+      iconURL,
+      text: `${action} ${song.derived.songString}`,
+    },
+    color: "#08d58f",
+  });
+
+  const simple: MessageEmbedOptions = {
+    title: song.derived.songName,
+    description: song.derived.artistString,
+    url: `https://beatsbot.one/play?uri=${encodeURIComponent(song.uri)}`,
+    fields: [
+      {
+        name: "Duration",
+        value: song.derived.durationString,
+        inline: true,
+      },
+    ],
+    color: "#08d58f",
+    thumbnail,
+  };
+
+  return { nowPlaying, action, simple };
 };
 
 const stop = async function () {
